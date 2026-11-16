@@ -14,7 +14,7 @@ canvas#gl{position:fixed;inset:0;width:100%;height:100%;display:block}
 #cockpit{position:fixed;inset:0;pointer-events:none;z-index:3;display:none}
 #cockpit svg{width:100%;height:100%;display:block}
 #hud{position:fixed;inset:0;pointer-events:none;z-index:5;text-shadow:var(--sh)}
-.panel{position:absolute;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:8px 12px;backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px)}
+.panel{position:absolute;background:rgba(10,14,20,.56);border:1px solid var(--line);border-radius:6px;padding:8px 12px}   /* no backdrop blur: blurring a live 3D canvas behind five panels every frame is very costly on integrated graphics */
 .lab{font-size:10px;letter-spacing:.18em;opacity:.72;display:block}
 .val{font-size:clamp(26px,4.2vmin,42px);font-weight:700;letter-spacing:.04em;line-height:1.1}
 .unit{font-size:11px;opacity:.75;margin-left:4px}
@@ -131,7 +131,7 @@ details.ctl[open] summary::before{content:"\2212  "}
   GEAR <span class="flag" id="gearS">DOWN</span><br>FLAPS <span class="flag" id="flapS">2</span><br>BRAKES <span class="flag" id="brkS">OFF</span><br>ASSIST <span class="flag" id="astS">ON</span><br>CAM <span class="flag" id="camS">CHASE</span></div>
  <div id="mapWrap" class="panel"><canvas id="mapCv" width="180" height="180"></canvas></div>
  <div id="msg"></div>
- <div id="hint">W/S throttle &middot; Arrows pitch/roll &middot; A/D rudder &middot; Space brakes &middot; G gear &middot; F/V flaps &middot; C camera (J / K wing views) &middot; Esc menu / switch aircraft &middot; H help</div>
+ <div id="hint">W/S throttle &middot; Arrows pitch/roll &middot; A/D rudder &middot; Space brakes &middot; G gear &middot; F/V flaps &middot; C camera (J / K wing views) &middot; Esc menu / switch aircraft &middot; H help &middot; F3 stats</div>
 </div>
 
 <div id="menu" class="ov">
@@ -199,6 +199,33 @@ const lerp=(a,b,t)=>a+(b-a)*t;
 const smoothstep=(a,b,x)=>{const t=clamp((x-a)/(b-a),0,1);return t*t*(3-2*t);};
 const approach=(v,t,d)=>v<t?Math.min(v+d,t):Math.max(v-d,t);
 const sc=hex=>new THREE.Color(hex).convertSRGBToLinear();
+// merge every single-material mesh of a group that shares a material into one mesh (one draw call instead of dozens)
+function mergeByMaterial(grp){
+  const buckets=new Map();
+  for(const m of grp.children.slice()){
+    if(!m.isMesh||Array.isArray(m.material)||m.children.length)continue;
+    m.updateMatrix();const k=m.material.uuid+(m.castShadow?'c':'')+(m.receiveShadow?'r':'');
+    let b=buckets.get(k);if(!b){b={mat:m.material,cast:m.castShadow,recv:m.receiveShadow,list:[]};buckets.set(k,b);}b.list.push(m);
+  }
+  for(const b of buckets.values()){
+    if(b.list.length<2)continue;
+    let nv=0,ni=0;for(const m of b.list){const g=m.geometry;nv+=g.attributes.position.count;ni+=g.index?g.index.count:g.attributes.position.count;}
+    const P=new Float32Array(nv*3),N=new Float32Array(nv*3),U=new Float32Array(nv*2),I=new Uint32Array(ni);
+    let vo=0,io=0;const v=new THREE.Vector3(),nm=new THREE.Matrix3();
+    for(const m of b.list){
+      const g=m.geometry,pa=g.attributes.position,na=g.attributes.normal,ua=g.attributes.uv;nm.getNormalMatrix(m.matrix);
+      for(let i=0;i<pa.count;i++){
+        v.fromBufferAttribute(pa,i).applyMatrix4(m.matrix);P[(vo+i)*3]=v.x;P[(vo+i)*3+1]=v.y;P[(vo+i)*3+2]=v.z;
+        if(na){v.fromBufferAttribute(na,i).applyMatrix3(nm).normalize();N[(vo+i)*3]=v.x;N[(vo+i)*3+1]=v.y;N[(vo+i)*3+2]=v.z;}
+        if(ua){U[(vo+i)*2]=ua.getX(i);U[(vo+i)*2+1]=ua.getY(i);}
+      }
+      if(g.index){for(let i=0;i<g.index.count;i++)I[io+i]=g.index.getX(i)+vo;io+=g.index.count;}else{for(let i=0;i<pa.count;i++)I[io+i]=vo+i;io+=pa.count;}
+      vo+=pa.count;grp.remove(m);g.dispose();
+    }
+    const geo=new THREE.BufferGeometry();geo.setAttribute('position',new THREE.BufferAttribute(P,3));geo.setAttribute('normal',new THREE.BufferAttribute(N,3));geo.setAttribute('uv',new THREE.BufferAttribute(U,2));geo.setIndex(new THREE.BufferAttribute(I,1));
+    const mesh=new THREE.Mesh(geo,b.mat);mesh.castShadow=b.cast;mesh.receiveShadow=b.recv;grp.add(mesh);
+  }
+}
 function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
 const rnd=mulberry32(20261101);
 function hash2(ix,iz){let h=(Math.imul(ix,374761393)+Math.imul(iz,668265263))|0;h=Math.imul(h^(h>>>13),1274126177);h^=h>>>16;return(h>>>0)/4294967296;}
@@ -281,8 +308,13 @@ const QSYS=(function(){
     high:  {name:'HIGH',  res:1.75,smap:2048,city:1.0, veg:1.0, des:1.0, ai:3}};
   let stored=null;try{stored=localStorage.getItem('dwf_quality');}catch(e){}
   const first=!LV[stored];
-  const level=first?((navigator.hardwareConcurrency||4)>=8?'high':'medium'):stored;
-  const q={LV,level,first,meshes:[],dpr:window.devicePixelRatio||1,drs:1,   // drs = dynamic resolution scale (0.55..1) that keeps the frame rate steady
+  // first run: pick from the graphics chip (integrated chips -> MEDIUM, dedicated / Apple -> HIGH); the frame-rate governor adapts from there
+  const guess=(()=>{try{const c=document.createElement('canvas'),g=c.getContext('webgl')||c.getContext('experimental-webgl');const e=g&&g.getExtension('WEBGL_debug_renderer_info');const r=e?String(g.getParameter(e.UNMASKED_RENDERER_WEBGL)):'';
+    if(/apple|nvidia|geforce|rtx|gtx|radeon rx|radeon pro|quadro/i.test(r))return 'high';
+    if(/intel|uhd|iris|adreno|mali|powervr|swiftshader|llvmpipe|basic render|vega|radeon\(tm\)|radeon graphics|amd radeon/i.test(r))return 'medium';}catch(e){}
+    return 'medium';})();
+  const level=first?guess:stored;
+  const q={LV,level,first,meshes:[],dpr:window.devicePixelRatio||1,drs:1,dens:1,shOK:true,userSet:false,   // drs = dynamic resolution scale (0.55..1) that keeps the frame rate steady
    
     cur(){return LV[q.level];},
     pr(){const L=LV[q.level];return(q.level==='high'?Math.min(q.dpr,L.res):Math.min(q.dpr,1)*L.res)*q.drs;},
@@ -296,10 +328,10 @@ const QSYS=(function(){
     apply(){
       const L=LV[q.level];if(q.applyTerrain)q.applyTerrain();
       q.applyRes();
-      sun.castShadow=L.smap>0&&!(typeof TOD!=='undefined'&&TOD&&TOD.k>=0.5);   // no shadow pass at night
+      sun.castShadow=L.smap>0&&q.shOK&&!(typeof TOD!=='undefined'&&TOD&&TOD.k>=0.5);   // no shadow pass at night
       if(L.smap>0&&sun.shadow.mapSize.x!==L.smap){sun.shadow.mapSize.set(L.smap,L.smap);if(sun.shadow.map){sun.shadow.map.dispose();sun.shadow.map=null;}}
       for(const m of q.meshes){
-        const d=L[m.kind];m.im.count=Math.min(m.n,m.fixed+Math.floor((m.n-m.fixed)*d));
+        const d=L[m.kind]*q.dens;m.im.count=Math.min(m.n,m.fixed+Math.floor((m.n-m.fixed)*d));
         if(m.castHigh)m.im.castShadow=q.level==='high';
       }
     }};
@@ -312,23 +344,56 @@ const renderer=new THREE.WebGLRenderer({canvas,antialias:QSYS.level!=='low',powe
 renderer.setPixelRatio(QSYS.pr());
 renderer.setSize(window.innerWidth,window.innerHeight,false);
 renderer.outputEncoding=THREE.sRGBEncoding;
-renderer.shadowMap.enabled=true;renderer.shadowMap.type=THREE.PCFSoftShadowMap;
+renderer.shadowMap.enabled=true;renderer.shadowMap.type=THREE.PCFShadowMap;   // PCFSoft costs ~4x the texture reads per pixel for little visible gain
 const scene=new THREE.Scene();
 scene.fog=new THREE.FogExp2(0xe8b88a,0.000052);   // fog is applied in display space, matches sky horizon
 const camera=new THREE.PerspectiveCamera(62,window.innerWidth/window.innerHeight,2,70000);
 const sunDir=new THREE.Vector3(-0.72,0.5,0.38).normalize();
 
+/* ---- cheaper image-based lighting (r128 reads the PMREM cube 8x for diffuse + 8x for specular on EVERY pixel) ----
+   Diffuse ambient is replaced by a 6-colour "ambient cube" integrated from the same sky gradient; specular on rough surfaces (>0.8: sand, concrete, paint)
+   uses it too, and only shiny surfaces (glass, metal, water) still read the environment map. */
+{
+  const hex=h=>[(h>>16&255)/255,(h>>8&255)/255,(h&255)/255];
+  const H=hex(0xe8b88a),M=hex(0x9fb2c9),Z=hex(0x2b5ea6),SD=[-0.72,0.5,0.38],sl=Math.hypot(...SD);SD[0]/=sl;SD[1]/=sl;SD[2]/=sl;
+  const ss=(a,b,x)=>{const t=Math.min(1,Math.max(0,(x-a)/(b-a)));return t*t*(3-2*t);};
+  const sky=(x,y,z)=>{const l=Math.hypot(x,y,z);x/=l;y/=l;z/=l;let c=[0,0,0];
+    if(y>=0){const a=ss(0,0.3,Math.pow(y,0.7)),b=ss(0.2,0.9,y);for(let i=0;i<3;i++){const t=H[i]+(M[i]-H[i])*a;c[i]=t+(Z[i]-t)*b;}}
+    else{const g=[0.72,0.54,0.38],k=ss(0,0.35,-y);for(let i=0;i<3;i++)c[i]=H[i]+(g[i]-H[i])*k;}
+    const sd=Math.max(0,x*SD[0]+y*SD[1]+z*SD[2]),w1=Math.pow(sd,6)*0.35,w2=Math.pow(sd,40)*0.5;
+    c[0]+=w1+w2*1.0;c[1]+=w1*0.62+w2*0.82;c[2]+=w1*0.30+w2*0.55;
+    return c.map(v=>Math.pow(Math.max(v,0),2.2));};
+  const AX=[[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]],amb=[];
+  for(const a of AX){let sum=[0,0,0],wt=0;
+    for(let i=0;i<24;i++){const th=(i+0.5)/24*Math.PI,st=Math.sin(th),ct=Math.cos(th);
+      for(let j=0;j<48;j++){const ph=(j+0.5)/48*2*Math.PI,d=[st*Math.cos(ph),ct,st*Math.sin(ph)];
+        const w=Math.max(0,d[0]*a[0]+d[1]*a[1]+d[2]*a[2])+0.12;      // slightly broader than a cosine lobe, like the blurred environment map it replaces
+        const c=sky(d[0],d[1],d[2]);wt+=w*st;for(let k=0;k<3;k++)sum[k]+=c[k]*w*st;}}
+    amb.push(sum.map(v=>v/wt));}
+  const v3=c=>'vec3('+c.map(v=>v.toFixed(4)).join(',')+')';
+  const AMB_GLSL=`vec3 dwfAmb(vec3 n){vec3 nn=n*n;return nn.x*(n.x>0.0?${v3(amb[0])}:${v3(amb[1])})+nn.y*(n.y>0.0?${v3(amb[2])}:${v3(amb[3])})+nn.z*(n.z>0.0?${v3(amb[4])}:${v3(amb[5])});}\n`;
+  let ch=THREE.ShaderChunk.envmap_physical_pars_fragment;
+  const a1='vec4 envMapColor = textureCubeUV( envMap, worldNormal, 1.0 );',a2='vec4 envMapColor = textureCubeUV( envMap, reflectVec, roughness );';
+  if(ch.indexOf(a1)>=0&&ch.indexOf(a2)>=0){
+    ch=ch.replace('vec3 getLightProbeIndirectIrradiance',AMB_GLSL+'vec3 getLightProbeIndirectIrradiance');
+    ch=ch.replace(a1,'vec4 envMapColor = vec4( dwfAmb( worldNormal ), 1.0 );');
+    ch=ch.replace(a2,'vec4 envMapColor; if ( roughness > 0.8 ) envMapColor = vec4( dwfAmb( reflectVec ), 1.0 ); else envMapColor = textureCubeUV( envMap, reflectVec, roughness );');
+    THREE.ShaderChunk.envmap_physical_pars_fragment=ch;
+  }
+}
+
 const NIGHT_U={value:0};    // 0 = day, 1 = night: shared by the sky, city and terminal shaders
 const skyMat=new THREE.ShaderMaterial({
-  uniforms:{uNight:NIGHT_U,uSun:{value:sunDir},uH:{value:new THREE.Color(0xe8b88a)},uM:{value:new THREE.Color(0x9fb2c9)},uZ:{value:new THREE.Color(0x2b5ea6)}},
+  uniforms:{uNight:NIGHT_U,uCity:{value:new THREE.Vector3(0,0,-1)},uCityK:{value:0},uSun:{value:sunDir},uH:{value:new THREE.Color(0xe8b88a)},uM:{value:new THREE.Color(0x9fb2c9)},uZ:{value:new THREE.Color(0x2b5ea6)}},
   vertexShader:'varying vec3 vDir;void main(){vDir=position;gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);}',
-  fragmentShader:`uniform float uNight;uniform vec3 uSun;uniform vec3 uH;uniform vec3 uM;uniform vec3 uZ;varying vec3 vDir;
+  fragmentShader:`uniform float uNight;uniform vec3 uCity;uniform float uCityK;uniform vec3 uSun;uniform vec3 uH;uniform vec3 uM;uniform vec3 uZ;varying vec3 vDir;
   void main(){
     vec3 d=normalize(vDir);float h=d.y;vec3 col;
     if(h>=0.0){col=mix(uH,uM,smoothstep(0.0,0.3,pow(h,0.7)));col=mix(col,uZ,smoothstep(0.2,0.9,h));}
     else{col=mix(uH,mix(vec3(0.72,0.54,0.38),vec3(0.05,0.06,0.10),uNight),smoothstep(0.0,0.35,-h));}
     float s=max(dot(d,normalize(uSun)),0.0);
     col+=mix(vec3(1.0,0.62,0.30)*0.35,vec3(0.30,0.40,0.65)*0.10,uNight)*pow(s,6.0)+mix(vec3(1.0,0.82,0.55)*0.5,vec3(0.55,0.65,0.9)*0.12,uNight)*pow(s,40.0)+mix(vec3(1.0,0.95,0.8)*2.0,vec3(0.86,0.9,1.0)*1.5,uNight)*smoothstep(0.9993,0.9998,s);
+    if(uCityK>0.001&&h>-0.02){float cd=max(dot(d,uCity),0.0);col+=vec3(1.0,0.60,0.28)*uCityK*(0.55*pow(cd,24.0)+0.45*pow(cd,160.0))*exp(-max(h,0.0)*11.0);}   // the glow of the lit city above the horizon
     if(uNight>0.001&&h>0.0){vec3 sq=floor(d*520.0);float sh=fract(sin(dot(sq,vec3(12.9898,78.233,37.719)))*43758.5453);
       col+=vec3(0.75,0.82,1.0)*step(0.9996,sh)*(0.55+0.45*fract(sh*517.0))*smoothstep(0.03,0.3,h)*uNight;}
     gl_FragColor=vec4(col,1.0);}`,
@@ -378,12 +443,12 @@ function buildTerrain(){
   geo.computeVertexNormals();
   const mat=new THREE.MeshStandardMaterial({vertexColors:true,roughness:0.97,metalness:0});
   mat.onBeforeCompile=sh=>{
-    sh.uniforms.uBurj={value:new THREE.Vector2(WORLD.BURJ.x,WORLD.BURJ.z)};
+    sh.uniforms.uBurj={value:new THREE.Vector2(WORLD.BURJ.x,WORLD.BURJ.z)};sh.uniforms.uNight=NIGHT_U;
     sh.vertexShader=sh.vertexShader
       .replace('#include <common>','#include <common>\nattribute float aCity;varying float vCity;varying vec3 vWP;')
       .replace('#include <project_vertex>','#include <project_vertex>\nvCity=aCity;vWP=(modelMatrix*vec4(transformed,1.0)).xyz;');
     sh.fragmentShader=sh.fragmentShader
-      .replace('#include <common>','#include <common>\nvarying float vCity;varying vec3 vWP;uniform vec2 uBurj;\n'+GLSL_HASH)
+      .replace('#include <common>','#include <common>\nvarying float vCity;varying vec3 vWP;uniform vec2 uBurj;uniform float uNight;float gLamp=0.0;\n'+GLSL_HASH)
       .replace('#include <color_fragment>',`#include <color_fragment>
       {
         float dist=length(vViewPosition);float fn=exp(-dist/650.0);float fnF=exp(-dist/2400.0);
@@ -391,37 +456,51 @@ function buildTerrain(){
         vec2 wn=vec2(0.94,-0.34),wd=vec2(0.34,0.94);
         vec2 q=vec2(dot(p,wn),dot(p,wd));
         // macro colour patches: iron-rich red sand, pale crests, dark hardpan / sabkha
-        float m1=vn(p*0.0011+3.1),m2=vn(p*0.0042+9.2),m3=vn(p*0.019+1.7),m4=vn(p*0.09+5.3);
+        float m1=vn(p*0.0011+3.1),m2=vn(p*0.0042+9.2);
         vec3 cr=diffuseColor.rgb;
         cr=mix(cr,vec3(0.62,0.31,0.14),smoothstep(0.52,0.82,m1)*0.40*(1.0-vCity));
         cr=mix(cr,vec3(0.80,0.60,0.36),smoothstep(0.55,0.85,m2)*0.28*(1.0-vCity));
         cr=mix(cr,vec3(0.34,0.27,0.20),smoothstep(0.64,0.80,vn(p*0.0027+17.0))*0.55*step(vWP.y,9.0)*(1.0-vCity));
-        cr*=0.90+0.20*m3;
-        // wind streaks and ripples, fading with distance
-        float streak=vn(vec2(q.x*0.9,q.y*0.05)+4.0);
-        float rip=sin(q.x*2.4+3.0*vn(q*vec2(0.06,0.02)))*0.5+0.5;
-        cr*=1.0+((streak-0.5)*0.20+(rip-0.5)*0.22)*fn;
-        float g1=hash12(floor(p*1.6)),g2=hash12(floor(p*0.3)+7.0);
-        cr*=1.0+(g1-0.5)*0.16*fn+(g2-0.5)*0.07;
-        // pebbles / gravel flecks near the camera
-        float peb=step(0.955,hash12(floor(p*2.7)))*fn*fn;
-        cr=mix(cr,vec3(0.17,0.13,0.10)*(0.7+0.8*hash12(floor(p*2.7)+3.0)),peb*0.8*(1.0-vCity));
-        cr*=1.0-0.10*fnF*smoothstep(0.55,0.9,m4);
+        // fine detail: every term below is already faded out by distance, so far pixels (most of the screen) skip the noise entirely
+        float w3=1.0-smoothstep(2500.0,5000.0,dist);
+        if(w3>0.0)cr*=0.90+0.20*mix(0.5,vn(p*0.019+1.7),w3);
+        if(dist<2600.0){
+          // wind streaks and ripples, fading with distance
+          float streak=vn(vec2(q.x*0.9,q.y*0.05)+4.0);
+          float rip=sin(q.x*2.4+3.0*vn(q*vec2(0.06,0.02)))*0.5+0.5;
+          cr*=1.0+((streak-0.5)*0.20+(rip-0.5)*0.22)*fn;
+          float g1=hash12(floor(p*1.6)),g2=hash12(floor(p*0.3)+7.0);
+          cr*=1.0+(g1-0.5)*0.16*fn+(g2-0.5)*0.07*(1.0-smoothstep(1200.0,2600.0,dist));
+          // pebbles / gravel flecks near the camera
+          float peb=step(0.955,hash12(floor(p*2.7)))*fn*fn;
+          cr=mix(cr,vec3(0.17,0.13,0.10)*(0.7+0.8*hash12(floor(p*2.7)+3.0)),peb*0.8*(1.0-vCity));
+        }
+        if(dist<4500.0)cr*=1.0-0.10*fnF*(1.0-smoothstep(2500.0,4500.0,dist))*smoothstep(0.55,0.9,vn(p*0.09+5.3));
         diffuseColor.rgb=cr;
         vec2 gp=mod(vWP.xz,80.0);
         float road=max(step(gp.x,13.0),step(gp.y,13.0));
         float plaza=smoothstep(170.0,320.0,length(vWP.xz-uBurj));
         float cm=smoothstep(0.3,0.75,vCity)*plaza;
-        road*=1.0-smoothstep(0.52,0.78,vn(vWP.xz*0.018));
+        if(cm>0.002)road*=1.0-smoothstep(0.52,0.78,vn(vWP.xz*0.018));
         float cl=step(abs(gp.x-6.5),0.22)*step(0.5,fract(vWP.z/9.0))+step(abs(gp.y-6.5),0.22)*step(0.5,fract(vWP.x/9.0));
         float curb=max(step(gp.x,13.0)*step(12.4,gp.x),step(gp.y,13.0)*step(12.4,gp.y))+max(step(gp.x,0.6),step(gp.y,0.6));
         diffuseColor.rgb=mix(diffuseColor.rgb,vec3(0.075,0.07,0.065),road*cm*0.9);
         diffuseColor.rgb=mix(diffuseColor.rgb,vec3(0.55,0.45,0.28),clamp(cl,0.0,1.0)*road*cm*0.5*fn);
         diffuseColor.rgb=mix(diffuseColor.rgb,vec3(0.45,0.42,0.38),clamp(curb,0.0,1.0)*cm*0.5*(1.0-step(0.5,road))*fn);
         diffuseColor.rgb=mix(diffuseColor.rgb,diffuseColor.rgb*vec3(0.78,0.74,0.7),cm*0.6*(1.0-road));
+        if(uNight>0.02&&cm>0.002){
+          // night: rows of street lamps down the middle of every road (grown with distance so they glow instead of shimmering) + a soft light on the road surface
+          float rad=max(1.3,dist*0.0024);
+          vec2 dl=vec2(gp.x-6.5,mod(vWP.z,24.0)-12.0),dl2=vec2(gp.y-6.5,mod(vWP.x,24.0)-12.0);
+          float lampX=step(gp.x,13.0)*(1.0-smoothstep(0.0,rad,length(dl)));
+          float lampZ=step(gp.y,13.0)*(1.0-smoothstep(0.0,rad,length(dl2)));
+          float lamp=max(lampX,lampZ)*(1.3/rad)*(1.3/rad)*1.6;
+          gLamp=(lamp+road*0.05*(1.0-smoothstep(1500.0,6000.0,dist))+cm*0.03)*cm*uNight;
+        }
       }`)
+      .replace('#include <emissivemap_fragment>','#include <emissivemap_fragment>\ntotalEmissiveRadiance+=vec3(1.0,0.66,0.32)*gLamp;')
       .replace('#include <normal_fragment_maps>',`#include <normal_fragment_maps>
-      {
+      if(length(vViewPosition)<1400.0){
         float fw=exp(-length(vViewPosition)/320.0)*(1.0-smoothstep(0.3,0.75,vCity));
         vec2 pq=vWP.xz;vec2 q2=vec2(dot(pq,vec2(0.94,-0.34)),dot(pq,vec2(0.34,0.94)));
         float dh=cos(2.4*q2.x+3.0*vn(q2*vec2(0.06,0.02)))*2.4;
@@ -453,17 +532,49 @@ function buildClouds(){
   const r0=mulberry32(5);
   for(let i=0;i<7;i++){const px=40+r0()*48,py=44+r0()*40,r=26+r0()*26,g=x.createRadialGradient(px,py,0,px,py,r);
     g.addColorStop(0,'rgba(255,255,255,0.55)');g.addColorStop(1,'rgba(255,255,255,0)');x.fillStyle=g;x.fillRect(0,0,128,128);}
-  const tex=new THREE.CanvasTexture(c),r2=mulberry32(77),grp=new THREE.Group();grp.name='clouds';
+  const tex=new THREE.CanvasTexture(c),r2=mulberry32(77);
+  // all cloud puffs are ONE instanced draw call (they used to be ~360 separate sprites = 360 draw calls). Billboarded in the vertex shader, fogged like sprites were.
+  const OFF=[],SZ=[],COL=[];
   for(let k=0;k<44;k++){
     const cx=WORLD.CEN.x+(r2()-0.5)*44000,cz=WORLD.CEN.z+(r2()-0.5)*44000,cy=1700+r2()*1700;
-    const mat=new THREE.SpriteMaterial({map:tex,color:new THREE.Color().setHSL(0.07+r2()*0.03,0.6,0.86+r2()*0.08),transparent:true,opacity:0.5,depthWrite:false});
+    const col=new THREE.Color().setHSL(0.07+r2()*0.03,0.6,0.86+r2()*0.08);
     const n=5+Math.floor(r2()*6);
     for(let j=0;j<n;j++){
-      const s=new THREE.Sprite(mat),sz=500+r2()*700;
-      s.position.set(cx+(r2()-0.5)*1400,cy+(r2()-0.5)*160,cz+(r2()-0.5)*900);s.scale.set(sz*1.6,sz*0.7,1);grp.add(s);
+      const sz=500+r2()*700;
+      OFF.push(cx+(r2()-0.5)*1400,cy+(r2()-0.5)*160,cz+(r2()-0.5)*900);SZ.push(sz*1.6,sz*0.7);COL.push(col.r,col.g,col.b);
     }
   }
-  scene.add(grp);
+  const N=OFF.length/3,geo=new THREE.InstancedBufferGeometry();
+  geo.setAttribute('position',new THREE.BufferAttribute(new Float32Array([-0.5,-0.5,0,0.5,-0.5,0,0.5,0.5,0,-0.5,0.5,0]),3));
+  geo.setAttribute('uv',new THREE.BufferAttribute(new Float32Array([0,0,1,0,1,1,0,1]),2));geo.setIndex([0,1,2,0,2,3]);
+  const aOff=new THREE.InstancedBufferAttribute(new Float32Array(OFF),3),aSz=new THREE.InstancedBufferAttribute(new Float32Array(SZ),2),aCol=new THREE.InstancedBufferAttribute(new Float32Array(COL),3);
+  aOff.setUsage(THREE.DynamicDrawUsage);geo.setAttribute('aOff',aOff);geo.setAttribute('aSz',aSz);geo.setAttribute('aCol',aCol);geo.instanceCount=N;
+  const mat=new THREE.ShaderMaterial({
+    uniforms:THREE.UniformsUtils.merge([THREE.UniformsLib.fog,{map:{value:tex},uTint:{value:new THREE.Vector3(1,1,1)},uOp:{value:0.5}}]),
+    vertexShader:`attribute vec3 aOff;attribute vec2 aSz;attribute vec3 aCol;varying vec2 vUv;varying vec3 vCol;
+      #include <fog_pars_vertex>
+      void main(){vUv=uv;vCol=aCol;vec4 mvPosition=viewMatrix*vec4(aOff,1.0);mvPosition.xy+=position.xy*aSz;gl_Position=projectionMatrix*mvPosition;
+      #include <fog_vertex>
+      }`,
+    fragmentShader:`uniform sampler2D map;uniform vec3 uTint;uniform float uOp;varying vec2 vUv;varying vec3 vCol;
+      #include <fog_pars_fragment>
+      void main(){vec4 t=texture2D(map,vUv);gl_FragColor=vec4(vCol*uTint*t.rgb,uOp*t.a);
+      #include <encodings_fragment>
+      #include <fog_fragment>
+      }`,
+    transparent:true,depthWrite:false,fog:true});
+  const mesh=new THREE.Mesh(geo,mat);mesh.name='clouds';mesh.frustumCulled=false;mesh.renderOrder=-5;
+  // draw order: far puffs first. Re-sorted when the camera has moved a long way.
+  let sx=1e9,sy=0,sz2=0;const idx=new Uint16Array(N),d=new Float32Array(N);
+  mesh.userData.sort=cp=>{
+    if(Math.abs(cp.x-sx)+Math.abs(cp.y-sy)+Math.abs(cp.z-sz2)<600)return;sx=cp.x;sy=cp.y;sz2=cp.z;
+    for(let i=0;i<N;i++){const dx=OFF[i*3]-cp.x,dy=OFF[i*3+1]-cp.y,dz=OFF[i*3+2]-cp.z;d[i]=dx*dx+dy*dy+dz*dz;idx[i]=i;}
+    const order=Array.from(idx).sort((a,b)=>d[b]-d[a]);
+    const o2=new Float32Array(N*3),s2=new Float32Array(N*2),c2=new Float32Array(N*3);
+    for(let k=0;k<N;k++){const i=order[k];o2[k*3]=OFF[i*3];o2[k*3+1]=OFF[i*3+1];o2[k*3+2]=OFF[i*3+2];s2[k*2]=SZ[i*2];s2[k*2+1]=SZ[i*2+1];c2[k*3]=COL[i*3];c2[k*3+1]=COL[i*3+1];c2[k*3+2]=COL[i*3+2];}
+    aOff.array.set(o2);aSz.array.set(s2);aCol.array.set(c2);aOff.needsUpdate=aSz.needsUpdate=aCol.needsUpdate=true;
+  };
+  mesh.userData.mat=mat;scene.add(mesh);
 }
 buildClouds();
 
@@ -607,6 +718,7 @@ function buildBurj(){
   add(cylGeo(15,25,560,6,8,16),0,280,0);          // hexagonal core
   add(cylGeo(6,12,140,24,8,16),0,630,0);          // upper cylinder
   add(cylGeo(0.4,3.2,128,12,8,16),0,764,0);       // spire
+  mergeByMaterial(grp);                            // 27 meshes -> 1 draw call
   // plinth + lake
   const plinth=new THREE.Mesh(new THREE.CylinderGeometry(96,106,5,56),new THREE.MeshStandardMaterial({color:sc(0xb9a58a),roughness:0.85,envMap:ENV,envMapIntensity:0.4}));
   plinth.position.set(0,y0+2.5,0);plinth.receiveShadow=true;grp.add(plinth);
@@ -788,7 +900,11 @@ function makeCityMat(){
           col=mix(col,mix(wall,gl,avg),lodA);
           float wvF=mix(wv,glassB>0.5?0.72:0.45,lodA);
           gWin=wvF*(1.0-lodA*0.5);gGls=gWin*glassB;
-          gLit=wvF*mix(step(mix(0.94,0.62,uNight),rr),mix(0.06,0.38,uNight)*0.6,lodA);
+          // distant towers: patches of lit floors (not single windows, which would shimmer); the patchiness fades out with distance
+          float cellAmp=1.0-smoothstep(2.0,7.0,pxf);
+          float farPatch=mix(1.0,0.25+0.75*hash12(vec2(floor(u/(pw*4.0))+seed*7.0,floor(yy/(fh*2.0)))),cellAmp);
+          float farLit=mix(0.06,0.78*farPatch*(0.55+0.45*hash12(vec2(seed*5.0,1.0))),uNight);
+          gLit=wvF*mix(step(mix(0.94,0.52,uNight),rr),farLit,lodA);
         }
         col*=mix(1.0,0.4,uNight);                       // night paint: walls and roofs darker so the lit windows read
         diffuseColor.rgb=col*diffuseColor.rgb;
@@ -1454,16 +1570,18 @@ function upTri(P,I,a,b,c){   // push a triangle whose normal points up (+y)
   const signTex=(txt,bg,fg)=>{const c=document.createElement('canvas');c.width=256;c.height=96;const g=c.getContext('2d');g.fillStyle=bg;g.fillRect(0,0,256,96);g.strokeStyle=fg;g.lineWidth=5;g.strokeRect(4,4,248,88);
     g.font='bold 62px Arial,Helvetica,sans-serif';g.textAlign='center';g.textBaseline='middle';g.fillStyle=fg;g.fillText(txt,128,52);const t=new THREE.CanvasTexture(c);t.encoding=THREE.sRGBEncoding;t.anisotropy=8;return t;};
   const postM=new THREE.MeshStandardMaterial({color:0x8a8f95,roughness:0.6,metalness:0.4});
-  const order=[...CONN_Z].sort((a,b)=>b-a);
+  const order=[...CONN_Z].sort((a,b)=>b-a),poleAt=[];
   order.forEach((zc,i)=>{
+    const signMat=new THREE.MeshBasicMaterial({map:signTex('B'+(i+1),'#111','#f0c820'),fog:true});
     const hp=new THREE.Mesh(new THREE.PlaneGeometry(3.4,28),holdMat);hp.rotation.x=-Math.PI/2;hp.position.set(44.7,PAV+0.012,zc);hp.receiveShadow=true;scene.add(hp);
     for(const sz of[-1,1]){
-      const sg=new THREE.Mesh(new THREE.BoxGeometry(0.18,1.05,3.6),[0,1,2,3,4,5].map(k=>k<2?new THREE.MeshBasicMaterial({map:signTex('B'+(i+1),'#111','#f0c820'),fog:true}):new THREE.MeshStandardMaterial({color:0x222222})));
+      const sg=new THREE.Mesh(new THREE.BoxGeometry(0.18,1.05,3.6),signMat);   // one material = one draw call (was 6 materials = 6 calls per sign)
       sg.position.set(44.7,PAV+1.9,zc+sz*(14+3.2));scene.add(sg);
-      const pole=new THREE.Mesh(new THREE.CylinderGeometry(0.07,0.07,1.4,6),postM);pole.position.set(44.7,PAV+0.75,zc+sz*(14+3.2));scene.add(pole);
+      poleAt.push([44.7,PAV+0.75,zc+sz*(14+3.2)]);
       addCyl(44.7,zc+sz*(14+3.2),0.5,PAV+2.5,0);
     }
   });
+  {const pm=new THREE.InstancedMesh(new THREE.CylinderGeometry(0.07,0.07,1.4,6),postM,poleAt.length),mm=new THREE.Matrix4();poleAt.forEach((q,k)=>pm.setMatrixAt(k,mm.makeTranslation(q[0],q[1],q[2])));pm.frustumCulled=false;scene.add(pm);}
   // 4) lights
   const col=[],pos=[];
   for(let i=0;i<edges.length;i+=4){pos.push(edges[i],PAV+0.3,edges[i+1],edges[i+2],PAV+0.3,edges[i+3]);for(let k=0;k<2;k++)col.push(0.2,0.35,1);}
@@ -2364,6 +2482,8 @@ function aiAnim(a,dt,t){
   const ground=a.h<0.6&&ph!=='final'&&ph!=='ga'&&ph!=='climb';
   const thr=ph==='ga'||ph==='climb'?0.95:ph==='tkoff'?(a.tk>a.wait?0.95:0.1):ph==='final'?0.3:ph==='roll'?(a.s<350?0.55:0.15):ph==='push'?0.02:ph==='park'?0:0.12;
   poseAircraft(R,{gear:a.gp,steer:clamp(a.yaw*6,-1,1),thr,speed:ground?(ph==='push'?-a.v:a.v):0,fan:ph==='park'||ph==='push'?0.4:undefined},dt,t);
+  // far-away traffic: the wheels (24 meshes per aircraft) are sub-pixel specks, so skip their draw calls
+  const wv=a.rig.group.position.distanceToSquared(camera.position)<450*450;if(R.wv!==wv){R.wv=wv;for(const w of R.wheels)w.visible=wv;}
 }
 function aiRemove(i){const a=AI.list[i];scene.remove(a.rig.group);AI.list.splice(i,1);}
 // collision of the player with AI aircraft: simple fuselage / wing / tail volumes in the AI's local frame
@@ -2384,8 +2504,7 @@ var TOD=(function(){
   const U=skyMat.uniforms;
   const day={H:U.uH.value.clone(),M:U.uM.value.clone(),Z:U.uZ.value.clone(),dir:sunDir.clone(),sunC:sun.color.clone(),sunI:sun.intensity,hs:hemi.color.clone(),hg:hemi.groundColor.clone(),hi:hemi.intensity};
   const night={H:new THREE.Color(0x1b2745),M:new THREE.Color(0x0e1830),Z:new THREE.Color(0x050b1c),dir:new THREE.Vector3(0.40,0.60,-0.50).normalize(),sunC:new THREE.Color(0x9db6ff),sunI:0.2,hs:new THREE.Color(0x44579a),hg:new THREE.Color(0x232b43),hi:0.24};
-  const clouds=scene.getObjectByName('clouds'),cl0=[];
-  if(clouds)clouds.traverse(o=>{if(o.isSprite)cl0.push([o.material,o.material.color.clone(),o.material.opacity]);});
+  const clouds=scene.getObjectByName('clouds'),cloudU=clouds?clouds.userData.mat.uniforms:null;
   const dust0=dustPts.material.color.clone(),dop0=dustPts.material.opacity;
   const pts=[];scene.traverse(o=>{if(o.isPoints&&o.material&&o.material.map&&o.material.size){o.material.userData.sz0=o.material.size;pts.push(o.material);}});
   // glow sprites: cap their on-screen size so sprites right next to the camera cannot cover the screen (large additive overdraw = fps loss)
@@ -2412,12 +2531,12 @@ var TOD=(function(){
     sunDir.copy(day.dir).lerp(night.dir,k).normalize();
     sun.color.copy(day.sunC).lerp(night.sunC,k);sun.intensity=lerp(day.sunI,night.sunI,k);
     hemi.color.copy(day.hs).lerp(night.hs,k);hemi.groundColor.copy(day.hg).lerp(night.hg,k);hemi.intensity=lerp(day.hi,night.hi,k);
-    for(const [m,c,o] of cl0){m.color.copy(c).multiplyScalar(lerp(1,0.14,k));m.color.b=Math.min(1,m.color.b+0.05*k);m.opacity=lerp(o,o*0.7,k);}
+    if(cloudU){const f=lerp(1,0.14,k);cloudU.uTint.value.set(f,f,f+0.06*k);cloudU.uOp.value=lerp(0.5,0.35,k);}
     dustPts.material.color.copy(dust0).multiplyScalar(lerp(1,0.12,k));
     T.applyEnv(scene);
     if(wallM){wallM.opacity=lerp(1,0.28,k);wallM.color.setRGB(lerp(1,0.55,k),lerp(1,0.65,k),lerp(1,0.9,k));}
     // moonlight casts no shadow map at night (nothing to see, and the shadow pass + per-pixel shadow lookups are a big cost)
-    const wantSh=k<0.5&&QSYS.cur().smap>0;if(sun.castShadow!==wantSh)sun.castShadow=wantSh;
+    const wantSh=k<0.5&&QSYS.cur().smap>0&&QSYS.shOK;if(sun.castShadow!==wantSh)sun.castShadow=wantSh;
   };
   T.set=function(night_,instant){
     T.target=night_?1:0;if(instant){T.k=T.target;}
@@ -2871,7 +2990,7 @@ function drawMap(){
   c.fillStyle='#fff';c.strokeStyle='#000';c.lineWidth=1;c.beginPath();c.moveTo(0,-7);c.lineTo(5,6);c.lineTo(0,3);c.lineTo(-5,6);c.closePath();c.fill();c.stroke();c.restore();
 }
 
-let lastWarn='',hudTick=0,hudFlip=false;
+let lastWarn='',hudTick=0,hudFlip=false,hudCv=0;
 function updateHUD(dt){
   const P=PL;
   hudTick+=dt;
@@ -2911,7 +3030,7 @@ function updateHUD(dt){
     const html=w.map(x=>'<div class="'+x[1]+'">'+x[0]+'</div>').join('');
     if(html!==lastWarn){E.warn.innerHTML=html;lastWarn=html;}
   }
-  if((hudFlip=!hudFlip))drawADI(),drawHeading(),drawMap();    // 2-D HUD canvases at half rate: same look, less CPU work every frame
+  hudCv+=dt;if(hudCv>=0.048){hudCv=0;drawADI();drawHeading();drawMap();}    // 2-D HUD canvases at ~20 Hz: same look, a fixed small cost whatever the frame rate
 }
 
 /* ============ 17. AUDIO ============ */
@@ -3090,7 +3209,7 @@ function goMainMenu(){
 function startGame(){
   if(started)return;
   if(MENU.ac!==CUR.id){setAircraft(MENU.ac);ORB.dist=CUR.orbit.dist;}
-  started=true;aiClear();hideMenu();camera.clearViewOffset();E.hud.classList.remove('off');
+  started=true;QSYS.perf.hold=performance.now()+3000;if(!TOD.warmed)setTimeout(()=>TOD.warm(),1500);aiClear();hideMenu();camera.clearViewOffset();E.hud.classList.remove('off');
   if(AUD.ctx){try{AUD.ctx.resume();}catch(e){}}else initAudio();setCamMode(0);doReset(MENU.start);
   setTimeout(()=>showMsg(MENU.start==='approach'?'FINAL APPROACH · 3° GLIDESLOPE · hold '+Math.round(vrefNow()*MS2KT)+' kt · flare at 50 ft':'W = throttle up  ·  hold SPACE for brakes  ·  rotate at ~145 kt',4600),2700);
 }
@@ -3161,35 +3280,51 @@ window.addEventListener('mousemove',e=>{MOUSE.x=dz((e.clientX/window.innerWidth-
 buildCards();
 document.querySelectorAll('#modes .mode').forEach(b=>b.addEventListener('click',()=>pickMode(b.dataset.mode)));
 function refreshQual(){document.querySelectorAll('#qual .mode').forEach(b=>b.classList.toggle('on',b.dataset.q===QSYS.level));}
-document.querySelectorAll('#qual .mode').forEach(b=>b.addEventListener('click',()=>{QSYS.set(b.dataset.q,true);QSYS.perf.hold=performance.now()+8000;refreshQual();}));
+document.querySelectorAll('#qual .mode').forEach(b=>b.addEventListener('click',()=>{QSYS.userSet=true;QSYS.set(b.dataset.q,true);QSYS.perf.hold=performance.now()+8000;refreshQual();}));
 // automatic step-down: if the frame rate stays low while flying, drop one quality level and say so
-QSYS.perf={n:0,t0:performance.now(),low:0,hold:performance.now()+8000};
+QSYS.perf={n:0,t0:performance.now(),low:0,hold:performance.now()+8000,cpu:0,fps:60,cpuMs:0,frameMs:16};
+// Frame-rate governor. Ladder of reductions applied ON TOP of the chosen quality level (so HIGH stays HIGH, it just adapts):
+// resolution first, then the shadow pass, then scenery density. Steps down fast when the frame rate is under the target, back up slowly with headroom.
+const GOV=[{drs:1,sh:1,dens:1},{drs:0.88,sh:1,dens:1},{drs:0.88,sh:0,dens:1},{drs:0.76,sh:0,dens:0.8},{drs:0.66,sh:0,dens:0.65},{drs:0.56,sh:0,dens:0.5}];
+QSYS.step=0;
+function govApply(i){const S=GOV[i];QSYS.step=i;QSYS.drs=S.drs;QSYS.dens=S.dens;QSYS.shOK=!!S.sh;QSYS.apply();try{localStorage.setItem('dwf_gov_'+QSYS.level,String(i));}catch(e){}}
+// start where this machine settled last time, so the first seconds of a flight are not spent stepping down
+try{const sv=parseInt(localStorage.getItem('dwf_gov_'+QSYS.level));if(sv>0&&sv<GOV.length)govApply(sv);}catch(e){}
 function perfWatch(){
   const P=QSYS.perf,now=performance.now();P.n++;
   if(now-P.t0<1000)return;
-  const fps=P.n*1000/(now-P.t0);P.n=0;P.t0=now;
+  const fps=P.n*1000/(now-P.t0);P.cpuMs=P.cpu/Math.max(1,P.n);P.frameMs=(now-P.t0)/Math.max(1,P.n);P.fps=fps;P.cpu=0;P.n=0;P.t0=now;
   if(document.hidden||!started||paused||PL.crashed||now<P.hold){P.low=0;P.good=0;return;}
-  // dynamic resolution: trade pixels for a steady frame rate. Down fast (below ~52 fps), back up slowly (after 5+ s at full speed), with a longer wait if going up keeps failing.
-  if(now>(P.drsHold||0)){
-    if(fps<52&&QSYS.drs>0.56){
-      // if lowering the resolution does not raise the frame rate (CPU-bound, or the browser caps it at 30), stop: lower resolution would only make it blurry
-      if(P.fpsBefore!==undefined&&fps<=P.fpsBefore+2.5)P.steps=(P.steps||0)+1;else P.steps=0;
-      if(P.steps>=2){QSYS.drs=P.drsFirst||1;QSYS.applyRes();P.drsHold=now+30000;P.steps=0;P.fpsBefore=undefined;}
-      else{
-        if(P.fpsBefore===undefined)P.drsFirst=QSYS.drs;P.fpsBefore=fps;
-        if(P.lastUp&&now-P.lastUp<9000)P.upWait=Math.min(40,(P.upWait||5)*2);
-        QSYS.drs=Math.max(0.56,Math.round((QSYS.drs-(fps<36?0.16:0.08))*100)/100);P.good=0;P.drsHold=now+1400;QSYS.applyRes();
-      }
-    }else if(fps>=57){P.fpsBefore=undefined;P.steps=0;
-      P.good=(P.good||0)+1;
-      if(P.good>=(P.upWait||5)&&QSYS.drs<1){QSYS.drs=Math.min(1,Math.round((QSYS.drs+0.06)*100)/100);P.good=0;P.lastUp=now;P.drsHold=now+1400;QSYS.applyRes();}
-    }else P.good=0;
+  if(now<(P.drsHold||0))return;
+  const TARGET=38,TOP=55,last=GOV.length-1;
+  if(fps<TARGET&&QSYS.step<last){
+    // if two reductions in a row changed nothing, the limit is elsewhere (browser frame cap, CPU): undo them and stop pushing for a while
+    if(P.fpsBefore!==undefined&&fps<=P.fpsBefore+2)P.nogain=(P.nogain||0)+1;else P.nogain=0;
+    if(P.nogain>=2){govApply(P.stepBase||0);P.holdLen=Math.min(300000,(P.holdLen||40000)*2);P.drsHold=now+P.holdLen;P.nogain=0;P.fpsBefore=undefined;return;}
+    if(P.fpsBefore===undefined)P.stepBase=QSYS.step;
+    P.fpsBefore=fps;
+    govApply(Math.min(last,QSYS.step+(fps<26?2:1)));P.good=0;P.drsHold=now+1500;
+    if(P.lastUp&&now-P.lastUp<9000)P.upWait=Math.min(40,(P.upWait||6)*2);
+  }else if(fps>=TOP){
+    P.fpsBefore=undefined;P.nogain=0;P.good=(P.good||0)+1;
+    if(P.good>=(P.upWait||6)&&QSYS.step>0){govApply(QSYS.step-1);P.good=0;P.lastUp=now;P.drsHold=now+1500;}
+  }else{P.good=0;if(fps>=TARGET)P.fpsBefore=undefined;}
+  // still slow with every reduction applied: only then drop the quality level (never if the person picked the level themselves)
+  P.low=(fps<24&&QSYS.step>=last)?P.low+1:0;
+  if(P.low>=8&&QSYS.level!=='low'&&!QSYS.userSet){
+    const nl=QSYS.level==='high'?'medium':'low';QSYS.set(nl,false);refreshQual();P.low=0;P.hold=now+8000;
+    showMsg('LOW FRAME RATE · GRAPHICS SET TO '+nl.toUpperCase()+' · CHANGE IT IN THE MENU',4500);
   }
-  P.low=(fps<26&&QSYS.drs<0.6)?P.low+1:0;
-  if(P.low>=6&&QSYS.level!=='low'){
-    const nl=QSYS.level==='high'?'medium':'low';QSYS.set(nl,true);refreshQual();P.low=0;P.hold=now+8000;
-    showMsg('LOW FRAME RATE \u00b7 GRAPHICS SET TO '+nl.toUpperCase()+' \u00b7 CHANGE IT IN THE MENU',4500);
-  }
+}
+// F3: performance stats (frame time, draw calls, resolution scale, which limit is being hit)
+const DBG=document.createElement('div');DBG.style.cssText='position:fixed;left:12px;top:132px;z-index:50;font:11px/1.4 ui-monospace,Consolas,monospace;color:#fff;background:rgba(0,0,0,.6);padding:6px 9px;border-radius:6px;white-space:pre;display:none;pointer-events:none';document.body.appendChild(DBG);
+const GPUSTR=(()=>{try{const g=renderer.getContext(),e=g.getExtension('WEBGL_debug_renderer_info');if(!e)return '?';const r=String(g.getParameter(e.UNMASKED_RENDERER_WEBGL));return (r.indexOf('ANGLE')>=0&&r.split(',').length>2?r.split(',')[1]:r).trim().replace(/\s*\(0x.*$/,'').replace(/\s*Direct3D.*$/,'').slice(0,52);}catch(e){return '?';}})();
+window.addEventListener('keydown',e=>{if(e.code==='F3'){e.preventDefault();DBG.style.display=DBG.style.display==='none'?'block':'none';dbgUpdate();}});
+function dbgUpdate(){
+  if(DBG.style.display==='none')return;const P=QSYS.perf,i=renderer.info.render,cb=P.cpuMs>0.7*P.frameMs;
+  DBG.textContent='FPS '+P.fps.toFixed(0)+'  frame '+P.frameMs.toFixed(1)+' ms  js '+P.cpuMs.toFixed(1)+' ms  ('+(cb?'CPU':'GPU')+'-limited)\n'
+   +QSYS.cur().name+' step '+QSYS.step+'/'+(GOV.length-1)+'  res x'+renderer.getPixelRatio().toFixed(2)+'  '+renderer.domElement.width+'x'+renderer.domElement.height+'\n'
+   +'calls '+i.calls+'  tris '+(i.triangles/1000).toFixed(0)+'k  shadows '+(sun.castShadow?'on':'off')+'  scenery '+(QSYS.dens*100).toFixed(0)+'%\n'+GPUSTR;
 }
 refreshQual();QSYS.apply();
 document.querySelectorAll('#tod .mode').forEach(b=>b.addEventListener('click',()=>TOD.set(b.dataset.t==='night',false)));
@@ -3209,8 +3344,8 @@ window.addEventListener('resize',()=>{
 camera.aspect=window.innerWidth/window.innerHeight;camera.updateProjectionMatrix();
 
 /* ============ 19. MAIN LOOP ============ */
-const PHYS_DT=1/120;
-let lastT=performance.now()/1000,acc=0,simT=0,fpsAcc=0,fpsN=0,spinV=0;
+const PHYS_DT=1/120;const CLOUD_MESH=scene.getObjectByName('clouds');
+let lastT=performance.now()/1000,acc=0,simT=0,fpsAcc=0,fpsN=0,spinV=0,frameNo=0;
 camPos.copy(PL.pos).add(new V3(0,9,45));
 function attractCamera(t){
   const a=t*0.12+0.6,r=CUR.orbit.dist*1.12,W=window.innerWidth,H=window.innerHeight;
@@ -3221,7 +3356,7 @@ function attractCamera(t){
 function frame(){
   requestAnimationFrame(frame);
   const now=performance.now()/1000;let dt=Math.min(now-lastT,0.05);lastT=now;
-  const P=PL;
+  const P=PL,_f0=performance.now();
   perfWatch();   // before drawing: a resolution change clears the canvas, so it must happen ahead of this frame's render, never after it
   if(started&&!paused){
     readInputs();
@@ -3251,13 +3386,18 @@ function frame(){
   if(started)updateCamera(dt,simT);else{RIG.group.position.copy(P.pos);RIG.group.quaternion.copy(P.quat);attractCamera(now);}
   // world follow-ups
   sky.position.copy(camera.position);
+  {const su=skyMat.uniforms,cx=WORLD.BURJ.x-camera.position.x,cy=80-camera.position.y,cz=WORLD.BURJ.z-camera.position.z,L=Math.hypot(cx,cy,cz)||1;su.uCity.value.set(cx/L,cy/L,cz/L);su.uCityK.value=NIGHT_U.value*smoothstep(30000,4000,L)*0.7;}
   sun.position.set(P.pos.x+sunDir.x*3000,P.pos.y+sunDir.y*3000,P.pos.z+sunDir.z*3000);sun.target.position.copy(P.pos);
+  if(CLOUD_MESH)CLOUD_MESH.userData.sort(camera.position);
   updateDust(camera.position);updateBlinkers(simT);updateAirportLights(simT,P.pos);
   if(!paused)updateParticles(dt);
   if(started){updateHUD(dt);updateAudio(dt);}
   renderer.render(scene,camera);
   if(camMode===1&&started&&COCK&&COCK.ok){try{COCK.draw(dt,simT,TOD);}catch(err){COCK.ok=false;renderer.autoClear=true;console.error('cockpit draw failed',err);document.getElementById('cockpit').style.display='block';}}
-  fpsAcc+=dt;fpsN++;if(fpsAcc>0.5){E.fps.textContent=Math.round(fpsN/fpsAcc)+' FPS';fpsAcc=0;fpsN=0;}
+  fpsAcc+=dt;fpsN++;if(fpsAcc>0.5){E.fps.textContent=Math.round(fpsN/fpsAcc)+' FPS';fpsAcc=0;fpsN=0;dbgUpdate();}
+  // skyscrapers only need to cast shadows when the player is near the city (their instance buffers are never frustum-culled, so a far-off shadow pass still draws all of them)
+  if((frameNo=(frameNo+1)|0)%20===0&&QSYS.level==='high'){const near=Math.hypot(P.pos.x-900,P.pos.z+7200)<2900;for(const m of QSYS.meshes)if(m.castHigh&&m.im.castShadow!==near)m.im.castShadow=near;}
+  QSYS.perf.cpu+=performance.now()-_f0;
 }
 setCamMode(0);
 frame();
